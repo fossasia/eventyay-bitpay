@@ -21,6 +21,9 @@ class BitpayApp(AppConfig):
         picture = "eventyay_bitpay/bitpay-logo.svg"
 
     def ready(self):
+        from .operational_log import log_plugin_loaded
+
+        log_plugin_loaded("bitpay")
         from . import signals  # NOQA
 
     @cached_property

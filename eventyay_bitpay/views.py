@@ -1,9 +1,11 @@
 import hashlib
 import json
 import logging
-import requests
+import time
 import urllib.parse
 from decimal import Decimal
+
+import requests
 from django.conf import settings
 from django.contrib import messages
 from django.core import signing
@@ -22,6 +24,12 @@ from eventyay.base.models import Order, OrderPayment, Quota
 from eventyay.base.services.locking import LockTimeoutException
 from eventyay.control.permissions import event_permission_required
 from eventyay.multidomain.urlreverse import build_absolute_uri, eventreverse
+
+from eventyay_bitpay.operational_log import (
+    OUTCOME_FAILURE,
+    OUTCOME_SUCCESS,
+    log_operation,
+)
 
 from .models import ReferencedBitPayObject
 from .payment import BitPay
@@ -72,10 +80,46 @@ def webhook(request, *args, **kwargs):
             "order", "order__event"
         ).get(reference=objid)
         if rso.order.event != request.event:
+            log_operation(
+                "webhook.inbound",
+                OUTCOME_FAILURE,
+                backend="bitpay",
+                payment_provider="bitpay",
+                error_code="event_mismatch",
+                status=200,
+                event_id=getattr(request.event, "pk", None),
+                order_id=rso.order_id,
+            )
             return HttpResponse("Unable to detect event", status=200)
         rso.order.log_action("eventyay_bitpay.event", data=event_json)
-        return process_invoice(rso.order, rso.payment, objid)
+        try:
+            response = process_invoice(rso.order, rso.payment, objid)
+        except Exception:
+            log_operation(
+                "webhook.inbound",
+                OUTCOME_FAILURE,
+                backend="bitpay",
+                payment_provider="bitpay",
+                error_code="processing_error",
+                event_id=rso.order.event_id,
+                order_id=rso.order_id,
+            )
+            raise
+        status = getattr(response, "status_code", None)
+        failed = isinstance(status, int) and status >= 400
+        log_operation(
+            "webhook.inbound",
+            OUTCOME_FAILURE if failed else OUTCOME_SUCCESS,
+            backend="bitpay",
+            payment_provider="bitpay",
+            error_code="processing_error" if failed else None,
+            status=status if isinstance(status, int) else None,
+            event_id=rso.order.event_id,
+            order_id=rso.order_id,
+        )
+        return response
     except ReferencedBitPayObject.DoesNotExist:
+        log_operation("webhook.inbound", OUTCOME_FAILURE, backend="bitpay", payment_provider="bitpay", error_code="unknown_reference", status=200)
         return HttpResponse("Unable to detect event", status=200)
 
 
@@ -178,7 +222,7 @@ class BitPayOrderView:
             # Do a hash comparison as well to harden timing attacks
             if (
                 "abcdefghijklmnopq".lower()
-                == hashlib.sha1("abcdefghijklmnopq".encode()).hexdigest()
+                == hashlib.sha1(b"abcdefghijklmnopq").hexdigest()
             ):
                 raise Http404("")
             else:
@@ -259,6 +303,7 @@ def auth_start(request, **kwargs):
         url = (
             "https://test.bitpay.com" if "test" in request.GET else "https://bitpay.com"
         )
+    started = time.monotonic()
     try:
         r = requests.post(
             url + "/tokens",
@@ -269,8 +314,26 @@ def auth_start(request, **kwargs):
             },
         )
     except requests.ConnectionError:
+        log_operation(
+            "connection.request",
+            OUTCOME_FAILURE,
+            backend="bitpay",
+            payment_provider="bitpay",
+            error_code="request_error",
+            duration_ms=int((time.monotonic() - started) * 1000),
+        )
         messages.error(request, _("Communication with BitPay was not successful."))
     else:
+        failed = r.status_code >= 400
+        log_operation(
+            "connection.request",
+            OUTCOME_FAILURE if failed else OUTCOME_SUCCESS,
+            backend="bitpay",
+            payment_provider="bitpay",
+            status=r.status_code,
+            duration_ms=int((time.monotonic() - started) * 1000),
+            error_code="http_error" if failed else None,
+        )
         if r.status_code == 200:
             data = r.json()["data"][0]
             request.event.settings.payment_bitpay_token = data["token"]

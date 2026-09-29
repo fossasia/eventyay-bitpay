@@ -1,24 +1,31 @@
-from typing import Union
-
 import hashlib
 import json
 import logging
-import requests
+import time
 from collections import OrderedDict
+from json import JSONDecodeError
+from typing import Union
+
+import requests
 from django import forms
 from django.core import signing
 from django.http import HttpRequest
 from django.template.loader import get_template
 from django.urls import reverse
 from django.utils.functional import cached_property
-from django.utils.translation import gettext_lazy as _  # NoQA
-from i18nfield.forms import I18nFormField, I18nTextInput
-from i18nfield.strings import LazyI18nString
-from json import JSONDecodeError
+from django.utils.translation import gettext_lazy as _
 from eventyay.base.models import OrderPayment, OrderRefund
 from eventyay.base.payment import BasePaymentProvider, PaymentException
 from eventyay.multidomain.urlreverse import build_absolute_uri
+from i18nfield.forms import I18nFormField, I18nTextInput
+from i18nfield.strings import LazyI18nString
 from requests import RequestException
+
+from eventyay_bitpay.operational_log import (
+    OUTCOME_FAILURE,
+    OUTCOME_SUCCESS,
+    log_operation,
+)
 
 from .models import ReferencedBitPayObject
 
@@ -212,12 +219,29 @@ class BitPay(BasePaymentProvider):
             )
         except RequestException:
             logger.exception("Failure during bitpay payment.")
+            log_operation(
+                "payment.charge",
+                OUTCOME_FAILURE,
+                backend="bitpay",
+                payment_provider="bitpay",
+                error_code="request_error",
+                event_id=self.event.pk,
+                order_id=payment.order_id,
+            )
             raise PaymentException(
                 _(
                     "We had trouble communicating with BitPay. Please try again and get in touch "
                     "with us if this problem persists."
                 )
             )
+        log_operation(
+            "payment.charge",
+            OUTCOME_SUCCESS,
+            backend="bitpay",
+            payment_provider="bitpay",
+            event_id=self.event.pk,
+            order_id=payment.order_id,
+        )
         ReferencedBitPayObject.objects.get_or_create(
             order=payment.order, payment=payment, reference=inv["id"]
         )
@@ -281,11 +305,20 @@ class BitPay(BasePaymentProvider):
             "X-Signature": xsignature,
             "X-accept-version": "2.0.0",
         }
+        started = time.monotonic()
         try:
             response = requests.post(
                 uri, data=payload, headers=headers, verify=self.client.verify
             )
         except Exception:
+            log_operation(
+                "connection.request",
+                OUTCOME_FAILURE,
+                backend="bitpay",
+                payment_provider="bitpay",
+                error_code="request_error",
+                duration_ms=int((time.monotonic() - started) * 1000),
+            )
             logger.exception("Failure during bitpay refund.")
             raise PaymentException(
                 _(
@@ -293,13 +326,23 @@ class BitPay(BasePaymentProvider):
                     "with us if this problem persists."
                 )
             )
+        failed = not response.ok
+        log_operation(
+            "connection.request",
+            OUTCOME_FAILURE if failed else OUTCOME_SUCCESS,
+            backend="bitpay",
+            payment_provider="bitpay",
+            status=response.status_code,
+            duration_ms=int((time.monotonic() - started) * 1000),
+            error_code="http_error" if failed else None,
+        )
         if not response.ok:
             try:
                 e = response.json()["error"]
             except JSONDecodeError:
                 e = response
 
-            logger.exception("Failure during bitpay refund: {}".format(e))
+            logger.exception(f"Failure during bitpay refund: {e}")
             raise PaymentException(_("BitPay reported an error: {}").format(e))
 
     def execute_refund(self, refund: OrderRefund):
