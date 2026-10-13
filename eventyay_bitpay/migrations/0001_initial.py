@@ -5,21 +5,44 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     initial = True
 
     dependencies = [
-        ('base', '0010_question_active'),
+        ("base", "0010_question_active"),
     ]
 
     operations = [
         migrations.CreateModel(
-            name='ReferencedBitPayObject',
+            name="ReferencedBitPayObject",
             fields=[
-                ('id', models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
-                ('reference', models.CharField(db_index=True, max_length=190, unique=True)),
-                ('order', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, to='base.order')),
-                ('payment', models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.CASCADE, to='base.orderpayment')),
+                (
+                    "id",
+                    models.BigAutoField(
+                        auto_created=True,
+                        primary_key=True,
+                        serialize=False,
+                        verbose_name="ID",
+                    ),
+                ),
+                (
+                    "reference",
+                    models.CharField(db_index=True, max_length=190, unique=True),
+                ),
+                (
+                    "order",
+                    models.ForeignKey(
+                        on_delete=django.db.models.deletion.CASCADE, to="base.order"
+                    ),
+                ),
+                (
+                    "payment",
+                    models.ForeignKey(
+                        blank=True,
+                        null=True,
+                        on_delete=django.db.models.deletion.CASCADE,
+                        to="base.orderpayment",
+                    ),
+                ),
             ],
         ),
     ]

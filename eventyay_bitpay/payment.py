@@ -1,10 +1,11 @@
-from typing import Union
-
 import hashlib
 import json
 import logging
-import requests
 from collections import OrderedDict
+from json import JSONDecodeError
+from typing import Union
+
+import requests
 from django import forms
 from django.core import signing
 from django.http import HttpRequest
@@ -12,12 +13,11 @@ from django.template.loader import get_template
 from django.urls import reverse
 from django.utils.functional import cached_property
 from django.utils.translation import gettext_lazy as _  # NoQA
-from i18nfield.forms import I18nFormField, I18nTextInput
-from i18nfield.strings import LazyI18nString
-from json import JSONDecodeError
 from eventyay.base.models import OrderPayment, OrderRefund
 from eventyay.base.payment import BasePaymentProvider, PaymentException
 from eventyay.multidomain.urlreverse import build_absolute_uri
+from i18nfield.forms import I18nFormField, I18nTextInput
+from i18nfield.strings import LazyI18nString
 from requests import RequestException
 
 from .models import ReferencedBitPayObject

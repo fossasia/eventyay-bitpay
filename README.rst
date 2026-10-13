@@ -244,6 +244,36 @@ Run tests, if tests are available in the checkout:
 
    pytest
 
+Install the development tools:
+
+.. code-block:: bash
+
+   pip install -e '.[dev]'
+
+Check lint, import sorting, formatting, and package contents:
+
+.. code-block:: bash
+
+   ruff check .
+   ruff format --check .
+   check-manifest --ignore .cache .
+
+Apply safe lint fixes and formatting locally:
+
+.. code-block:: bash
+
+   ruff check . --fix
+   ruff format .
+
+Ruff replaces Flake8, isort, and Black in the GitLab style job. Formatting
+keeps Black's 88-character line length, while linting retains the existing
+160-character limit. Import sorting keeps the ``pretix`` third-party
+classification and the ``setup.py`` exemption. Naming checks such as
+``N802`` remain disabled; the former ``W503`` check is replaced by the
+formatter's operator placement. Indentation is handled by the formatter.
+Generated migrations retain their existing Flake8-rule exemption, while
+Ruff still checks their import order and formatting.
+
 Package structure
 -----------------
 

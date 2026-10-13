@@ -17,6 +17,9 @@ dependencies = [
     "btcpay-python",
 ]
 
+[project.optional-dependencies]
+dev = ["ruff==0.16.8", "check-manifest"]
+
 [project.entry-points."pretix.plugin"]
 eventyay_bitpay = "eventyay_bitpay:PretixPluginMeta"
 
@@ -41,3 +44,25 @@ version = {attr = "eventyay_bitpay.__version__"}
 [tool.setuptools.packages.find]
 include = ["eventyay_bitpay*"]
 namespaces = false
+
+[tool.ruff]
+line-length = 88
+target-version = "py39"
+extend-exclude = [".ropeproject", "static", "_static", "build", ".cache"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E402"]
+
+[tool.ruff.lint.pycodestyle]
+max-line-length = 160
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+default-section = "third-party"
+known-third-party = ["pretix"]
+extra-standard-library = ["typing"]
+
+[tool.ruff.lint.per-file-ignores]
+"setup.py" = ["I"]
+"**/migrations/*.py" = ["E", "F", "W"]

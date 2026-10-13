@@ -1,9 +1,10 @@
 import hashlib
 import json
 import logging
-import requests
 import urllib.parse
 from decimal import Decimal
+
+import requests
 from django.conf import settings
 from django.contrib import messages
 from django.core import signing
