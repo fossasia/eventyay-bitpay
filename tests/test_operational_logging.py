@@ -13,14 +13,19 @@ from types import SimpleNamespace
 
 import pytest
 import requests
+from django.core.exceptions import PermissionDenied
 
 from eventyay_bitpay import operational_log
 from eventyay_bitpay.operational_log import (
     OUTCOME_FAILURE,
     OUTCOME_SUCCESS,
     _resolve_host_emitter,
+    bind_job_id,
+    bind_request_id,
     log_operation,
     logged_request,
+    reset_job_id,
+    reset_request_id,
 )
 
 
@@ -229,24 +234,46 @@ def test_logged_request_records_status_timeout_and_no_url(captured, monkeypatch)
         return Response()
 
     monkeypatch.setattr(requests, "post", fake_post)
-    logged_request(
-        "bitpay", "POST", "https://example.invalid/secret", json={"token": "raw"}
-    )
-    assert seen_kwargs[0]["timeout"] == 30
+    bind_request_id("req-abc-123")
+    bind_job_id("job-xyz-789")
+    try:
+        logged_request(
+            "bitpay",
+            "POST",
+            "https://example.invalid/secret",
+            json={"token": "raw"},
+            event_id=9,
+            order_id=10,
+            payment_provider="bitpay",
+        )
+        assert seen_kwargs[0]["timeout"] == 30
+        assert "event_id" not in seen_kwargs[0]
+        assert "order_id" not in seen_kwargs[0]
+        assert "payment_provider" not in seen_kwargs[0]
+        assert "request_id" not in seen_kwargs[0]
+        assert "job_id" not in seen_kwargs[0]
 
-    logged_request(
-        "bitpay",
-        "POST",
-        "https://example.invalid/secret",
-        json={"token": "raw"},
-        timeout=12,
-    )
-    assert seen_kwargs[1]["timeout"] == 12
+        logged_request(
+            "bitpay",
+            "POST",
+            "https://example.invalid/secret",
+            json={"token": "raw"},
+            timeout=12,
+        )
+        assert seen_kwargs[1]["timeout"] == 12
+    finally:
+        reset_request_id()
+        reset_job_id()
 
     assert captured[-1][1] == "connection.request"
     extra = captured[-1][2]
     assert extra["status"] == 201
     assert extra["outcome"] == "success"
+    assert extra["request_id"] == "req-abc-123"
+    assert extra["job_id"] == "job-xyz-789"
+    assert captured[-2][2]["event_id"] == 9
+    assert captured[-2][2]["order_id"] == 10
+    assert captured[-2][2]["payment_provider"] == "bitpay"
     assert "example.invalid" not in str(extra)
     assert "raw" not in str(extra)
 
@@ -346,10 +373,10 @@ def test_execute_payment_logs_success_only_after_persistence(captured, monkeypat
     with pytest.raises(KeyError):
         provider.execute_payment(request, payment)
 
-    assert all(item[2]["outcome"] != OUTCOME_SUCCESS for item in captured)
-    assert captured[-1][1] == "payment.charge"
-    assert captured[-1][2]["outcome"] == OUTCOME_FAILURE
-    assert captured[-1][2]["error_code"] == "response_error"
+    assert [item[1] for item in captured] == ["connection.request", "payment.charge"]
+    assert captured[0][2]["outcome"] == OUTCOME_SUCCESS
+    assert captured[1][2]["outcome"] == OUTCOME_FAILURE
+    assert captured[1][2]["error_code"] == "response_error"
 
 
 def test_webhook_logs_invalid_payload_quota_rejection_and_success(
@@ -517,3 +544,147 @@ def test_auth_start_validates_status_and_pairing_payload(captured, monkeypatch):
     assert captured[-1][2]["status"] == 200
     assert "secret-tok" not in str(captured[-1])
     assert "pair-xyz" not in str(captured[-1])
+
+
+def test_execute_refund_logs_local_completion_failure_without_retry(
+    captured, monkeypatch
+):
+    payment_module, _ = _load_plugin_modules(monkeypatch)
+    provider = payment_module.BitPay(SimpleNamespace(pk=15, settings=SimpleNamespace()))
+    refund_calls = []
+
+    def fake_refund(refund):
+        refund_calls.append(refund)
+
+    def broken_done():
+        raise RuntimeError("db commit failed")
+
+    monkeypatch.setattr(provider, "_refund", fake_refund)
+    refund = SimpleNamespace(order_id=77, done=broken_done)
+
+    with pytest.raises(RuntimeError, match="db commit failed"):
+        provider.execute_refund(refund)
+
+    assert len(refund_calls) == 1
+    assert captured[-1][1] == "payment.refund"
+    assert captured[-1][2]["outcome"] == OUTCOME_FAILURE
+    assert captured[-1][2]["error_code"] == "completion_error"
+    assert captured[-1][2]["event_id"] == 15
+    assert captured[-1][2]["order_id"] == 77
+
+
+def test_execute_payment_logs_connection_request_duration_and_http_error(
+    captured, monkeypatch
+):
+    payment_module, _ = _load_plugin_modules(monkeypatch)
+    provider = payment_module.BitPay(
+        SimpleNamespace(
+            pk=11,
+            currency="USD",
+            settings=SimpleNamespace(token="tok"),
+        )
+    )
+
+    def fail_http(payload):
+        raise requests.HTTPError(
+            "400 Client Error",
+            response=SimpleNamespace(status_code=400),
+        )
+
+    provider.__dict__["client"] = SimpleNamespace(create_invoice=fail_http)
+    payment = SimpleNamespace(
+        pk=5,
+        amount=10,
+        order_id=42,
+        info="",
+        order=SimpleNamespace(full_code="ABC-1", code="ABC", secret="sec"),
+    )
+    request = SimpleNamespace(session={})
+
+    with pytest.raises(payment_module.PaymentException):
+        provider.execute_payment(request, payment)
+
+    actions = [item[1] for item in captured]
+    assert actions == ["connection.request", "payment.charge"]
+    assert captured[0][2]["outcome"] == OUTCOME_FAILURE
+    assert captured[0][2]["status"] == 400
+    assert captured[0][2]["error_code"] == "http_error"
+    assert isinstance(captured[0][2]["duration_ms"], int)
+
+
+def test_permission_denied_logs_authenticated_only_and_auth_start_validates_url(
+    captured, monkeypatch
+):
+    _, views_module = _load_plugin_modules(monkeypatch)
+
+    monkeypatch.setattr(views_module, "reverse", lambda *a, **kw: "/control/bitpay/")
+    monkeypatch.setattr(
+        views_module,
+        "redirect",
+        lambda to: SimpleNamespace(status_code=302, url=to),
+    )
+    monkeypatch.setattr(views_module.messages, "error", lambda *a, **kw: None)
+
+    @views_module._log_permission_denied("bitpay.auth_start")
+    def denied_view(request):
+        raise PermissionDenied()
+
+    anon_req = SimpleNamespace(
+        user=SimpleNamespace(is_authenticated=False),
+        event=SimpleNamespace(pk=5),
+    )
+    with pytest.raises(PermissionDenied):
+        denied_view(anon_req)
+    assert captured == []
+
+    auth_req = SimpleNamespace(
+        user=SimpleNamespace(is_authenticated=True, pk=42),
+        event=SimpleNamespace(pk=5),
+    )
+    with pytest.raises(PermissionDenied):
+        denied_view(auth_req)
+    assert len(captured) == 1
+    assert captured[0][1] == "permission.denied"
+    assert captured[0][2]["outcome"] == OUTCOME_FAILURE
+    assert captured[0][2]["error_code"] == "forbidden"
+    assert captured[0][2]["model"] == "bitpay_settings"
+    assert captured[0][2]["route"] == "bitpay.auth_start"
+    assert captured[0][2]["event_id"] == 5
+    assert captured[0][2]["object_id"] == 5
+    assert captured[0][2]["user_id"] == 42
+
+    # Invalid URL must be rejected before HTTP requests or redirects.
+    called_urls = []
+    monkeypatch.setattr(
+        requests,
+        "post",
+        lambda url, *a, **kw: called_urls.append(url),
+    )
+    for bad_url in (
+        "javascript:alert(1)",
+        "http://evil.example",
+        "https://user:pass@bitpay.example",
+    ):
+        req = SimpleNamespace(
+            GET={"url": bad_url},
+            session={},
+            event=SimpleNamespace(
+                pk=5,
+                slug="ev",
+                organizer=SimpleNamespace(slug="org"),
+                settings=SimpleNamespace(payment_bitpay_token=None),
+            ),
+        )
+        resp = views_module.auth_start(req)
+        assert resp.status_code == 302
+        assert resp.url == "/control/bitpay/"
+        assert captured[-1][1] == "validation.error"
+        assert captured[-1][2]["error_code"] == "invalid_url"
+    assert called_urls == []
+
+    assert views_module._validate_bitpay_url("https://btcpay.example/") == (
+        "https://btcpay.example"
+    )
+    assert views_module._validate_bitpay_url("http://localhost:8080") == (
+        "http://localhost:8080"
+    )

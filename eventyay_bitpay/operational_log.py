@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+from contextvars import ContextVar
 
 import requests
 import requests.api as requests_api
@@ -21,10 +22,16 @@ OUTCOME_FAILURE = "failure"
 
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _LOGGER = logging.getLogger("eventyay.plugins")
+_request_id_var: ContextVar[str | None] = ContextVar(
+    "eventyay_bitpay_request_id", default=None
+)
+_job_id_var: ContextVar[str | None] = ContextVar("eventyay_bitpay_job_id", default=None)
+
 _INT_FIELDS = frozenset(
     {
         "event_id",
         "order_id",
+        "user_id",
         "status",
         "duration_ms",
     }
@@ -34,26 +41,85 @@ _IDENTIFIER_FIELDS = frozenset(
         "error_code",
         "backend",
         "payment_provider",
+        "request_id",
+        "job_id",
+        "model",
+        "route",
+    }
+)
+_REQUEST_LOG_CONTEXT_FIELDS = frozenset(
+    {
+        "event_id",
+        "order_id",
+        "payment_provider",
+        "request_id",
+        "job_id",
     }
 )
 _REQUEST_VERBS = frozenset({"get", "post", "put", "patch", "delete", "head", "options"})
 
 
-def _resolve_host_emitter():
+def _resolve_host_logging():
     try:
-        from eventyay.base.operational_logging import log_event
+        from eventyay.base.operational_logging import (
+            get_job_id,
+            get_request_id,
+            log_event,
+        )
     except Exception:  # noqa: BLE001
-        return None
-    return log_event
+        return None, None, None
+    return log_event, get_request_id, get_job_id
 
 
-_HOST_LOG_EVENT = _resolve_host_emitter()
+def _resolve_host_emitter():
+    emitter, _, _ = _resolve_host_logging()
+    return emitter
+
+
+_HOST_LOG_EVENT, _HOST_GET_REQUEST_ID, _HOST_GET_JOB_ID = _resolve_host_logging()
 
 
 def _safe_identifier(value):
     if isinstance(value, str) and _SAFE_IDENTIFIER.fullmatch(value):
         return value
     return None
+
+
+def bind_request_id(request_id: str | None) -> None:
+    _request_id_var.set(_safe_identifier(request_id))
+
+
+def reset_request_id() -> None:
+    _request_id_var.set(None)
+
+
+def bind_job_id(job_id: str | None) -> None:
+    _job_id_var.set(_safe_identifier(job_id))
+
+
+def reset_job_id() -> None:
+    _job_id_var.set(None)
+
+
+def _read_correlation_id(
+    host_getter, fallback_var: ContextVar[str | None]
+) -> str | None:
+    if host_getter is not None:
+        try:
+            host_id = _safe_identifier(host_getter())
+        except Exception:  # noqa: BLE001
+            host_id = None
+        if host_id is not None:
+            return host_id
+    return _safe_identifier(fallback_var.get())
+
+
+def get_request_id() -> str | None:
+    return _read_correlation_id(_HOST_GET_REQUEST_ID, _request_id_var)
+
+
+def get_job_id() -> str | None:
+    return _read_correlation_id(_HOST_GET_JOB_ID, _job_id_var)
 
 
 def _clean(fields):
@@ -70,6 +136,16 @@ def _clean(fields):
             cleaned = _safe_identifier(value if isinstance(value, str) else None)
             if cleaned is not None:
                 extra[key] = cleaned
+            continue
+        if key == "object_id":
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, int):
+                extra[key] = value
+            else:
+                cleaned = _safe_identifier(str(value))
+                if cleaned is not None:
+                    extra[key] = cleaned
     return extra
 
 
@@ -82,6 +158,14 @@ def log_operation(action, outcome, **fields):
             outcome = OUTCOME_FAILURE
         level = logging.WARNING if outcome == OUTCOME_FAILURE else logging.INFO
         payload = _clean(fields)
+        if "request_id" not in payload:
+            req_id = get_request_id()
+            if req_id is not None:
+                payload["request_id"] = req_id
+        if "job_id" not in payload:
+            job_id = get_job_id()
+            if job_id is not None:
+                payload["job_id"] = job_id
         emitter = _HOST_LOG_EVENT
         if emitter is not None:
             try:
@@ -132,12 +216,14 @@ def _send_request(method, url, **kwargs):
 def logged_request(backend, method, url, **kwargs):
     """Log status and duration for one HTTP call.
 
-    ``ok_statuses`` is not sent to the server. Use it when the caller already
-    treats a 4xx response as success. The same exception is re-raised.
-    The URL and body are not logged.
+    ``ok_statuses`` and safe logging context kwargs (``event_id``, ``order_id``,
+    ``payment_provider``, ``request_id``, ``job_id``) are not sent to the server.
+    The same exception is re-raised. The URL and body are not logged.
     """
     ok_statuses = kwargs.pop("ok_statuses", ())
-    payment_provider = kwargs.pop("payment_provider", None)
+    log_context = {
+        key: kwargs.pop(key) for key in _REQUEST_LOG_CONTEXT_FIELDS if key in kwargs
+    }
     kwargs.setdefault("timeout", 30)
     started = time.monotonic()
     try:
@@ -147,9 +233,9 @@ def logged_request(backend, method, url, **kwargs):
             "connection.request",
             OUTCOME_FAILURE,
             backend=backend,
-            payment_provider=payment_provider,
             error_code="timeout",
             duration_ms=_elapsed_ms(started),
+            **log_context,
         )
         raise
     except requests.RequestException:
@@ -157,9 +243,9 @@ def logged_request(backend, method, url, **kwargs):
             "connection.request",
             OUTCOME_FAILURE,
             backend=backend,
-            payment_provider=payment_provider,
             error_code="request_error",
             duration_ms=_elapsed_ms(started),
+            **log_context,
         )
         raise
     status = getattr(response, "status_code", None)
@@ -170,9 +256,9 @@ def logged_request(backend, method, url, **kwargs):
         "connection.request",
         OUTCOME_FAILURE if failed else OUTCOME_SUCCESS,
         backend=backend,
-        payment_provider=payment_provider,
         status=status if status_ok else None,
         duration_ms=_elapsed_ms(started),
         error_code="http_error" if failed else None,
+        **log_context,
     )
     return response

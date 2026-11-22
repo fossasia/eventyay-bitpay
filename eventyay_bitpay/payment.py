@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import time
 from collections import OrderedDict
 from json import JSONDecodeError
 
@@ -192,6 +193,7 @@ class BitPay(BasePaymentProvider):
     def execute_payment(self, request: HttpRequest, payment: OrderPayment):
         request.session["payment_bitpay_order_secret"] = payment.order.secret
 
+        started = time.monotonic()
         try:
             inv = self.client.create_invoice(
                 {
@@ -218,14 +220,36 @@ class BitPay(BasePaymentProvider):
                     "token": self.settings.token,
                 }
             )
-        except RequestException:
+        except RequestException as exc:
+            duration_ms = int((time.monotonic() - started) * 1000)
+            resp = getattr(exc, "response", None)
+            status = getattr(resp, "status_code", None)
+            status_ok = isinstance(status, int) and not isinstance(status, bool)
+            error_code = (
+                "timeout"
+                if isinstance(exc, requests.Timeout)
+                else ("http_error" if status_ok else "request_error")
+            )
             logger.exception("Failure during bitpay payment.")
+            log_operation(
+                "connection.request",
+                OUTCOME_FAILURE,
+                backend="bitpay",
+                payment_provider="bitpay",
+                error_code=error_code,
+                status=status if status_ok else None,
+                duration_ms=duration_ms,
+                event_id=self.event.pk,
+                order_id=payment.order_id,
+            )
             log_operation(
                 "payment.charge",
                 OUTCOME_FAILURE,
                 backend="bitpay",
                 payment_provider="bitpay",
-                error_code="request_error",
+                error_code=error_code,
+                status=status if status_ok else None,
+                duration_ms=duration_ms,
                 event_id=self.event.pk,
                 order_id=payment.order_id,
             )
@@ -235,6 +259,15 @@ class BitPay(BasePaymentProvider):
                     "with us if this problem persists."
                 )
             )
+        log_operation(
+            "connection.request",
+            OUTCOME_SUCCESS,
+            backend="bitpay",
+            payment_provider="bitpay",
+            duration_ms=int((time.monotonic() - started) * 1000),
+            event_id=self.event.pk,
+            order_id=payment.order_id,
+        )
         try:
             ReferencedBitPayObject.objects.get_or_create(
                 order=payment.order, payment=payment, reference=inv["id"]
@@ -329,6 +362,8 @@ class BitPay(BasePaymentProvider):
                 verify=self.client.verify,
                 timeout=30,
                 payment_provider="bitpay",
+                event_id=self.event.pk,
+                order_id=refund.order_id,
             )
         except Exception:
             logger.exception("Failure during bitpay refund.")
@@ -352,6 +387,7 @@ class BitPay(BasePaymentProvider):
     def execute_refund(self, refund: OrderRefund):
         try:
             self._refund(refund)
+            refund.done()
         except requests.exceptions.RequestException:
             logger.exception("BitPay error during refund.")
             log_operation(
@@ -380,16 +416,25 @@ class BitPay(BasePaymentProvider):
                 order_id=refund.order_id,
             )
             raise
-        else:
-            refund.done()
+        except Exception:
             log_operation(
                 "payment.refund",
-                OUTCOME_SUCCESS,
+                OUTCOME_FAILURE,
                 backend="bitpay",
                 payment_provider="bitpay",
+                error_code="completion_error",
                 event_id=self.event.pk,
                 order_id=refund.order_id,
             )
+            raise
+        log_operation(
+            "payment.refund",
+            OUTCOME_SUCCESS,
+            backend="bitpay",
+            payment_provider="bitpay",
+            event_id=self.event.pk,
+            order_id=refund.order_id,
+        )
 
     def shred_payment_info(self, obj: OrderPayment | OrderRefund):
         d = obj.info_data
