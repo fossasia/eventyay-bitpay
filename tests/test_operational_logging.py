@@ -522,6 +522,17 @@ def test_auth_start_validates_status_and_pairing_payload(captured, monkeypatch):
     assert captured[-1][2]["outcome"] == OUTCOME_FAILURE
     assert captured[-1][2]["error_code"] == "response_error"
 
+    # Non-ConnectionError RequestException (e.g. TooManyRedirects) must also log failure.
+    def fail_redirect(*a, **kw):
+        raise requests.TooManyRedirects("redirect loop")
+
+    monkeypatch.setattr(requests, "post", fail_redirect)
+    redir_resp = views_module.auth_start(make_request())
+    assert redir_resp.status_code == 302
+    assert captured[-1][1] == "connection.request"
+    assert captured[-1][2]["outcome"] == OUTCOME_FAILURE
+    assert captured[-1][2]["error_code"] == "request_error"
+
     # 200 with valid token + pairingCode logs success without leaking secrets.
     req = make_request()
     seen_timeouts = []
@@ -574,7 +585,7 @@ def test_execute_refund_logs_local_completion_failure_without_retry(
 
 
 def test_execute_payment_logs_connection_request_duration_and_http_error(
-    captured, monkeypatch
+    captured, monkeypatch, caplog
 ):
     payment_module, _ = _load_plugin_modules(monkeypatch)
     provider = payment_module.BitPay(
@@ -587,7 +598,7 @@ def test_execute_payment_logs_connection_request_duration_and_http_error(
 
     def fail_http(payload):
         raise requests.HTTPError(
-            "400 Client Error",
+            "400 Client Error: secret-response-body",
             response=SimpleNamespace(status_code=400),
         )
 
@@ -601,9 +612,13 @@ def test_execute_payment_logs_connection_request_duration_and_http_error(
     )
     request = SimpleNamespace(session={})
 
-    with pytest.raises(payment_module.PaymentException):
+    with (
+        caplog.at_level(logging.ERROR, logger=payment_module.logger.name),
+        pytest.raises(payment_module.PaymentException),
+    ):
         provider.execute_payment(request, payment)
 
+    assert "secret-response-body" not in caplog.text
     actions = [item[1] for item in captured]
     assert actions == ["connection.request", "payment.charge"]
     assert captured[0][2]["outcome"] == OUTCOME_FAILURE
@@ -664,6 +679,7 @@ def test_permission_denied_logs_authenticated_only_and_auth_start_validates_url(
         "javascript:alert(1)",
         "http://evil.example",
         "https://user:pass@bitpay.example",
+        "https://[",
     ):
         req = SimpleNamespace(
             GET={"url": bad_url},

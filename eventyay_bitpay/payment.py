@@ -230,7 +230,6 @@ class BitPay(BasePaymentProvider):
                 if isinstance(exc, requests.Timeout)
                 else ("http_error" if status_ok else "request_error")
             )
-            logger.exception("Failure during bitpay payment.")
             log_operation(
                 "connection.request",
                 OUTCOME_FAILURE,
@@ -365,8 +364,8 @@ class BitPay(BasePaymentProvider):
                 event_id=self.event.pk,
                 order_id=refund.order_id,
             )
-        except Exception:
-            logger.exception("Failure during bitpay refund.")
+        except Exception:  # noqa: BLE001
+            logger.error("Failure during bitpay refund.")
             raise PaymentException(
                 _(
                     "We had trouble communicating with BitPay. Please try again and get in touch "
@@ -389,7 +388,7 @@ class BitPay(BasePaymentProvider):
             self._refund(refund)
             refund.done()
         except requests.exceptions.RequestException:
-            logger.exception("BitPay error during refund.")
+            logger.error("BitPay error during refund.")
             log_operation(
                 "payment.refund",
                 OUTCOME_FAILURE,

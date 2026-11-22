@@ -73,7 +73,10 @@ def _validate_bitpay_url(raw_url):
     candidate = str(raw_url).strip()
     if not candidate or any(ch.isspace() for ch in candidate):
         return None
-    parsed = urllib.parse.urlparse(candidate)
+    try:
+        parsed = urllib.parse.urlparse(candidate)
+    except ValueError:
+        return None
     if parsed.scheme not in ("https", "http"):
         return None
     if parsed.scheme == "http" and parsed.hostname not in (
@@ -497,6 +500,17 @@ def auth_start(request, **kwargs):
         )
         messages.error(request, _("Communication with BitPay was not successful."))
     except requests.ConnectionError:
+        log_operation(
+            "connection.request",
+            OUTCOME_FAILURE,
+            backend="bitpay",
+            payment_provider="bitpay",
+            error_code="request_error",
+            duration_ms=int((time.monotonic() - started) * 1000),
+            event_id=request.event.pk,
+        )
+        messages.error(request, _("Communication with BitPay was not successful."))
+    except requests.RequestException:
         log_operation(
             "connection.request",
             OUTCOME_FAILURE,
