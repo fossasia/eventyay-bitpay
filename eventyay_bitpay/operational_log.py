@@ -9,10 +9,12 @@ Only opaque IDs, status codes, durations, and safe error codes are kept.
 
 from __future__ import annotations
 
-import functools
 import logging
 import re
 import time
+
+import requests
+import requests.api as requests_api
 
 OUTCOME_SUCCESS = "success"
 OUTCOME_FAILURE = "failure"
@@ -23,27 +25,29 @@ _INT_FIELDS = frozenset(
     {
         "event_id",
         "order_id",
-        "user_id",
         "status",
         "duration_ms",
-        "retry_count",
-        "webhook_id",
-        "recipient_count",
     }
 )
 _IDENTIFIER_FIELDS = frozenset(
     {
         "error_code",
         "backend",
-        "job_name",
         "payment_provider",
-        "model",
-        "order_code",
     }
 )
-_REQUEST_VERBS = frozenset(
-    {"get", "post", "put", "patch", "delete", "head", "options"}
-)
+_REQUEST_VERBS = frozenset({"get", "post", "put", "patch", "delete", "head", "options"})
+
+
+def _resolve_host_emitter():
+    try:
+        from eventyay.base.operational_logging import log_event
+    except Exception:  # noqa: BLE001
+        return None
+    return log_event
+
+
+_HOST_LOG_EVENT = _resolve_host_emitter()
 
 
 def _safe_identifier(value):
@@ -66,16 +70,6 @@ def _clean(fields):
             cleaned = _safe_identifier(value if isinstance(value, str) else None)
             if cleaned is not None:
                 extra[key] = cleaned
-            continue
-        if key == "object_id":
-            if isinstance(value, bool):
-                continue
-            if isinstance(value, int):
-                extra[key] = value
-            else:
-                cleaned = _safe_identifier(str(value))
-                if cleaned is not None:
-                    extra[key] = cleaned
     return extra
 
 
@@ -88,14 +82,14 @@ def log_operation(action, outcome, **fields):
             outcome = OUTCOME_FAILURE
         level = logging.WARNING if outcome == OUTCOME_FAILURE else logging.INFO
         payload = _clean(fields)
-        emitter = None
-        try:
-            from eventyay.base.operational_logging import log_event as emitter
-        except Exception:
-            emitter = None
+        emitter = _HOST_LOG_EVENT
         if emitter is not None:
-            emitter("plugins", action, outcome, level=level, **payload)
-            return
+            try:
+                emitter("plugins", action, outcome, level=level, **payload)
+            except Exception:  # noqa: BLE001
+                emitter = None
+            else:
+                return
         extra = {
             "component": "plugins",
             "outcome": outcome,
@@ -103,7 +97,7 @@ def log_operation(action, outcome, **fields):
             **payload,
         }
         _LOGGER.log(level, action, extra=extra)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return
 
 
@@ -121,9 +115,6 @@ def _send_request(method, url, **kwargs):
     A patched ``requests.get`` or ``requests.post`` wins. Otherwise a patched
     ``requests.request`` wins. Unpatched calls use the verb helper.
     """
-    import requests
-    import requests.api as requests_api
-
     verb_name = str(method).lower()
     if verb_name in _REQUEST_VERBS:
         patched = getattr(requests, verb_name, None)
@@ -145,9 +136,9 @@ def logged_request(backend, method, url, **kwargs):
     treats a 4xx response as success. The same exception is re-raised.
     The URL and body are not logged.
     """
-    import requests
-
     ok_statuses = kwargs.pop("ok_statuses", ())
+    payment_provider = kwargs.pop("payment_provider", None)
+    kwargs.setdefault("timeout", 30)
     started = time.monotonic()
     try:
         response = _send_request(method, url, **kwargs)
@@ -156,6 +147,7 @@ def logged_request(backend, method, url, **kwargs):
             "connection.request",
             OUTCOME_FAILURE,
             backend=backend,
+            payment_provider=payment_provider,
             error_code="timeout",
             duration_ms=_elapsed_ms(started),
         )
@@ -165,6 +157,7 @@ def logged_request(backend, method, url, **kwargs):
             "connection.request",
             OUTCOME_FAILURE,
             backend=backend,
+            payment_provider=payment_provider,
             error_code="request_error",
             duration_ms=_elapsed_ms(started),
         )
@@ -177,34 +170,9 @@ def logged_request(backend, method, url, **kwargs):
         "connection.request",
         OUTCOME_FAILURE if failed else OUTCOME_SUCCESS,
         backend=backend,
+        payment_provider=payment_provider,
         status=status if status_ok else None,
         duration_ms=_elapsed_ms(started),
         error_code="http_error" if failed else None,
     )
     return response
-
-
-def traced_job(job_name):
-    """Log job boundaries without changing the return value or exception."""
-
-    def decorator(fn):
-        @functools.wraps(fn)
-        def wrapper(*args, **kwargs):
-            log_operation("job.start", OUTCOME_SUCCESS, job_name=job_name)
-            try:
-                result = fn(*args, **kwargs)
-            except Exception as exc:
-                retried = type(exc).__name__ == "Retry"
-                log_operation(
-                    "job.retry" if retried else "job.fail",
-                    OUTCOME_FAILURE,
-                    job_name=job_name,
-                    error_code="retry" if retried else type(exc).__name__,
-                )
-                raise
-            log_operation("job.finish", OUTCOME_SUCCESS, job_name=job_name)
-            return result
-
-        return wrapper
-
-    return decorator

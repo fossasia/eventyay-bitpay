@@ -67,14 +67,40 @@ def redirect_view(request, *args, **kwargs):
         return r
 
 
+def _parse_pairing_response(response, base_url):
+    payload = response.json()
+    data = payload["data"][0]
+    token = data["token"]
+    pairing_code = data["pairingCode"]
+    if (
+        not isinstance(token, str)
+        or not token
+        or not isinstance(pairing_code, str)
+        or not pairing_code
+    ):
+        raise ValueError("Invalid BitPay pairing response")
+    return token, base_url + "/api-access-request?pairingCode=" + pairing_code
+
+
 @csrf_exempt
 @require_POST
 def webhook(request, *args, **kwargs):
-    event_json = json.loads(request.body.decode("utf-8"))
-    if "data" not in event_json and "id" in event_json:
-        objid = event_json["id"]
-    else:
-        objid = event_json["data"]["id"]
+    try:
+        event_json = json.loads(request.body.decode("utf-8"))
+        if "data" not in event_json and "id" in event_json:
+            objid = event_json["id"]
+        else:
+            objid = event_json["data"]["id"]
+    except Exception:
+        log_operation(
+            "webhook.inbound",
+            OUTCOME_FAILURE,
+            backend="bitpay",
+            payment_provider="bitpay",
+            error_code="invalid_payload",
+            event_id=getattr(getattr(request, "event", None), "pk", None),
+        )
+        raise
     try:
         rso = ReferencedBitPayObject.objects.select_related(
             "order", "order__event"
@@ -106,20 +132,32 @@ def webhook(request, *args, **kwargs):
             )
             raise
         status = getattr(response, "status_code", None)
-        failed = isinstance(status, int) and status >= 400
+        explicit_outcome = getattr(response, "_operational_outcome", None)
+        explicit_error = getattr(response, "_operational_error_code", None)
+        failed = explicit_outcome == OUTCOME_FAILURE or (
+            isinstance(status, int) and status >= 400
+        )
         log_operation(
             "webhook.inbound",
             OUTCOME_FAILURE if failed else OUTCOME_SUCCESS,
             backend="bitpay",
             payment_provider="bitpay",
-            error_code="processing_error" if failed else None,
+            error_code=(explicit_error or "processing_error") if failed else None,
             status=status if isinstance(status, int) else None,
             event_id=rso.order.event_id,
             order_id=rso.order_id,
         )
         return response
     except ReferencedBitPayObject.DoesNotExist:
-        log_operation("webhook.inbound", OUTCOME_FAILURE, backend="bitpay", payment_provider="bitpay", error_code="unknown_reference", status=200)
+        log_operation(
+            "webhook.inbound",
+            OUTCOME_FAILURE,
+            backend="bitpay",
+            payment_provider="bitpay",
+            error_code="unknown_reference",
+            status=200,
+            event_id=getattr(getattr(request, "event", None), "pk", None),
+        )
         return HttpResponse("Unable to detect event", status=200)
 
 
@@ -154,9 +192,17 @@ def process_invoice(order, payment, invoice_id):
                 try:
                     payment.confirm()
                 except LockTimeoutException:
-                    return HttpResponse("Lock timeout, please try again.", status=503)
+                    response = HttpResponse(
+                        "Lock timeout, please try again.", status=503
+                    )
+                    response._operational_outcome = OUTCOME_FAILURE
+                    response._operational_error_code = "lock_timeout"
+                    return response
                 except Quota.QuotaExceededException:
-                    return HttpResponse("Quota exceeded.", status=200)
+                    response = HttpResponse("Quota exceeded.", status=200)
+                    response._operational_outcome = OUTCOME_FAILURE
+                    response._operational_error_code = "quota_exceeded"
+                    return response
         elif src["status"] == ("expired", "invalid"):
             if payment.state in (
                 OrderPayment.PAYMENT_STATE_CREATED,
@@ -195,6 +241,13 @@ def process_invoice(order, payment, invoice_id):
 def auth_disconnect(request, **kwargs):
     del request.event.settings.payment_bitpay_token
     request.event.settings.payment_bitpay__enabled = False
+    log_operation(
+        "connection.disconnect",
+        OUTCOME_SUCCESS,
+        backend="bitpay",
+        payment_provider="bitpay",
+        event_id=request.event.pk,
+    )
     messages.success(request, _("Your BitPay account has been disconnected."))
 
     return redirect(
@@ -312,7 +365,19 @@ def auth_start(request, **kwargs):
                 "facade": "merchant",
                 "id": sin,
             },
+            timeout=30,
         )
+    except requests.Timeout:
+        log_operation(
+            "connection.request",
+            OUTCOME_FAILURE,
+            backend="bitpay",
+            payment_provider="bitpay",
+            error_code="timeout",
+            duration_ms=int((time.monotonic() - started) * 1000),
+            event_id=request.event.pk,
+        )
+        messages.error(request, _("Communication with BitPay was not successful."))
     except requests.ConnectionError:
         log_operation(
             "connection.request",
@@ -321,26 +386,47 @@ def auth_start(request, **kwargs):
             payment_provider="bitpay",
             error_code="request_error",
             duration_ms=int((time.monotonic() - started) * 1000),
+            event_id=request.event.pk,
         )
         messages.error(request, _("Communication with BitPay was not successful."))
     else:
-        failed = r.status_code >= 400
+        if r.status_code == 200:
+            try:
+                token, pairing_url = _parse_pairing_response(r, url)
+            except Exception:
+                log_operation(
+                    "connection.request",
+                    OUTCOME_FAILURE,
+                    backend="bitpay",
+                    payment_provider="bitpay",
+                    status=r.status_code,
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                    error_code="response_error",
+                    event_id=request.event.pk,
+                )
+                raise
+            log_operation(
+                "connection.request",
+                OUTCOME_SUCCESS,
+                backend="bitpay",
+                payment_provider="bitpay",
+                status=r.status_code,
+                duration_ms=int((time.monotonic() - started) * 1000),
+                event_id=request.event.pk,
+            )
+            request.event.settings.payment_bitpay_token = token
+            request.event.settings.payment_bitpay_url = url
+            return redirect(pairing_url)
         log_operation(
             "connection.request",
-            OUTCOME_FAILURE if failed else OUTCOME_SUCCESS,
+            OUTCOME_FAILURE,
             backend="bitpay",
             payment_provider="bitpay",
             status=r.status_code,
             duration_ms=int((time.monotonic() - started) * 1000),
-            error_code="http_error" if failed else None,
+            error_code="http_error",
+            event_id=request.event.pk,
         )
-        if r.status_code == 200:
-            data = r.json()["data"][0]
-            request.event.settings.payment_bitpay_token = data["token"]
-            request.event.settings.payment_bitpay_url = url
-            return redirect(
-                url + "/api-access-request?pairingCode=" + data["pairingCode"]
-            )
         messages.error(request, _("Communication with BitPay was not successful."))
 
     return redirect(
