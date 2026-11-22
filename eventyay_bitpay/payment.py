@@ -1,24 +1,33 @@
-from typing import Union
+from __future__ import annotations
 
 import hashlib
 import json
 import logging
-import requests
+import time
 from collections import OrderedDict
+from json import JSONDecodeError
+
+import requests
 from django import forms
 from django.core import signing
 from django.http import HttpRequest
 from django.template.loader import get_template
 from django.urls import reverse
 from django.utils.functional import cached_property
-from django.utils.translation import gettext_lazy as _  # NoQA
-from i18nfield.forms import I18nFormField, I18nTextInput
-from i18nfield.strings import LazyI18nString
-from json import JSONDecodeError
+from django.utils.translation import gettext_lazy as _
 from eventyay.base.models import OrderPayment, OrderRefund
 from eventyay.base.payment import BasePaymentProvider, PaymentException
 from eventyay.multidomain.urlreverse import build_absolute_uri
+from i18nfield.forms import I18nFormField, I18nTextInput
+from i18nfield.strings import LazyI18nString
 from requests import RequestException
+
+from eventyay_bitpay.operational_log import (
+    OUTCOME_FAILURE,
+    OUTCOME_SUCCESS,
+    log_operation,
+    logged_request,
+)
 
 from .models import ReferencedBitPayObject
 
@@ -184,6 +193,7 @@ class BitPay(BasePaymentProvider):
     def execute_payment(self, request: HttpRequest, payment: OrderPayment):
         request.session["payment_bitpay_order_secret"] = payment.order.secret
 
+        started = time.monotonic()
         try:
             inv = self.client.create_invoice(
                 {
@@ -210,20 +220,80 @@ class BitPay(BasePaymentProvider):
                     "token": self.settings.token,
                 }
             )
-        except RequestException:
-            logger.exception("Failure during bitpay payment.")
+        except RequestException as exc:
+            duration_ms = int((time.monotonic() - started) * 1000)
+            resp = getattr(exc, "response", None)
+            status = getattr(resp, "status_code", None)
+            status_ok = isinstance(status, int) and not isinstance(status, bool)
+            error_code = (
+                "timeout"
+                if isinstance(exc, requests.Timeout)
+                else ("http_error" if status_ok else "request_error")
+            )
+            log_operation(
+                "connection.request",
+                OUTCOME_FAILURE,
+                backend="bitpay",
+                payment_provider="bitpay",
+                error_code=error_code,
+                status=status if status_ok else None,
+                duration_ms=duration_ms,
+                event_id=self.event.pk,
+                order_id=payment.order_id,
+            )
+            log_operation(
+                "payment.charge",
+                OUTCOME_FAILURE,
+                backend="bitpay",
+                payment_provider="bitpay",
+                error_code=error_code,
+                status=status if status_ok else None,
+                duration_ms=duration_ms,
+                event_id=self.event.pk,
+                order_id=payment.order_id,
+            )
             raise PaymentException(
                 _(
                     "We had trouble communicating with BitPay. Please try again and get in touch "
                     "with us if this problem persists."
                 )
             )
-        ReferencedBitPayObject.objects.get_or_create(
-            order=payment.order, payment=payment, reference=inv["id"]
+        log_operation(
+            "connection.request",
+            OUTCOME_SUCCESS,
+            backend="bitpay",
+            payment_provider="bitpay",
+            duration_ms=int((time.monotonic() - started) * 1000),
+            event_id=self.event.pk,
+            order_id=payment.order_id,
         )
-        payment.info = json.dumps(inv)
-        payment.save(update_fields=["info"])
-        return self.redirect(request, inv["url"])
+        try:
+            ReferencedBitPayObject.objects.get_or_create(
+                order=payment.order, payment=payment, reference=inv["id"]
+            )
+            payment.info = json.dumps(inv)
+            payment.save(update_fields=["info"])
+            redirect_url = self.redirect(request, inv["url"])
+        except Exception:
+            log_operation(
+                "payment.charge",
+                OUTCOME_FAILURE,
+                backend="bitpay",
+                payment_provider="bitpay",
+                error_code="response_error",
+                event_id=self.event.pk,
+                order_id=payment.order_id,
+            )
+            raise
+        log_operation(
+            "payment.charge",
+            OUTCOME_SUCCESS,
+            backend="bitpay",
+            payment_provider="bitpay",
+            event_id=self.event.pk,
+            order_id=payment.order_id,
+        )
+        return redirect_url
 
     def payment_pending_render(self, request: HttpRequest, payment: OrderPayment):
         template = get_template("eventyay_bitpay/pending.html")
@@ -282,11 +352,20 @@ class BitPay(BasePaymentProvider):
             "X-accept-version": "2.0.0",
         }
         try:
-            response = requests.post(
-                uri, data=payload, headers=headers, verify=self.client.verify
+            response = logged_request(
+                "bitpay",
+                "POST",
+                uri,
+                data=payload,
+                headers=headers,
+                verify=self.client.verify,
+                timeout=30,
+                payment_provider="bitpay",
+                event_id=self.event.pk,
+                order_id=refund.order_id,
             )
-        except Exception:
-            logger.exception("Failure during bitpay refund.")
+        except Exception:  # noqa: BLE001
+            logger.error("Failure during bitpay refund.")
             raise PaymentException(
                 _(
                     "We had trouble communicating with BitPay. Please try again and get in touch "
@@ -299,24 +378,64 @@ class BitPay(BasePaymentProvider):
             except JSONDecodeError:
                 e = response
 
-            logger.exception("Failure during bitpay refund: {}".format(e))
+            logger.error(
+                "Failure during bitpay refund: status=%s", response.status_code
+            )
             raise PaymentException(_("BitPay reported an error: {}").format(e))
 
     def execute_refund(self, refund: OrderRefund):
         try:
             self._refund(refund)
-        except requests.exceptions.RequestException as e:
-            logger.exception("BitPay error: %s" % str(e))
+            refund.done()
+        except requests.exceptions.RequestException:
+            logger.error("BitPay error during refund.")
+            log_operation(
+                "payment.refund",
+                OUTCOME_FAILURE,
+                backend="bitpay",
+                payment_provider="bitpay",
+                error_code="request_error",
+                event_id=self.event.pk,
+                order_id=refund.order_id,
+            )
             raise PaymentException(
                 _(
                     "We had trouble communicating with BitPay. Please try again and contact "
                     "support if the problem persists."
                 )
             )
-        else:
-            refund.done()
+        except PaymentException:
+            log_operation(
+                "payment.refund",
+                OUTCOME_FAILURE,
+                backend="bitpay",
+                payment_provider="bitpay",
+                error_code="refund_error",
+                event_id=self.event.pk,
+                order_id=refund.order_id,
+            )
+            raise
+        except Exception:
+            log_operation(
+                "payment.refund",
+                OUTCOME_FAILURE,
+                backend="bitpay",
+                payment_provider="bitpay",
+                error_code="completion_error",
+                event_id=self.event.pk,
+                order_id=refund.order_id,
+            )
+            raise
+        log_operation(
+            "payment.refund",
+            OUTCOME_SUCCESS,
+            backend="bitpay",
+            payment_provider="bitpay",
+            event_id=self.event.pk,
+            order_id=refund.order_id,
+        )
 
-    def shred_payment_info(self, obj: Union[OrderPayment, OrderRefund]):
+    def shred_payment_info(self, obj: OrderPayment | OrderRefund):
         d = obj.info_data
         for k, v in list(d.items()):
             if v not in (

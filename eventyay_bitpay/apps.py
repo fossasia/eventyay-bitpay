@@ -3,6 +3,7 @@ from django.utils.functional import cached_property
 from django.utils.translation import gettext_lazy as _
 
 from . import __version__
+from .operational_log import log_plugin_loaded
 
 
 class BitpayApp(AppConfig):
@@ -21,6 +22,7 @@ class BitpayApp(AppConfig):
         picture = "eventyay_bitpay/bitpay-logo.svg"
 
     def ready(self):
+        log_plugin_loaded("bitpay")
         from . import signals  # NOQA
 
     @cached_property
