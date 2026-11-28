@@ -5,6 +5,7 @@ import json
 import logging
 import requests
 from collections import OrderedDict
+from collections.abc import Container
 from django import forms
 from django.core import signing
 from django.http import HttpRequest
@@ -37,6 +38,7 @@ SHREDDED_KEPT_KEYS = frozenset(
         "paymentTotals",
         "transactionCurrency",
         "amountPaid",
+        "amount",
     }
 )
 
@@ -333,23 +335,37 @@ class BitPay(BasePaymentProvider):
             refund.done()
 
     def shred_payment_info(self, obj: Union[OrderPayment, OrderRefund]):
-        d = obj.info_data
-        for k, v in list(d.items()):
-            if k not in SHREDDED_KEPT_KEYS:
-                d[k] = "█"
-        obj.info_data = d
-        obj.save()
+        try:
+            payment_info = obj.info_data
+        except JSONDecodeError:
+            payment_info = None
+        obj.info_data = redact_bitpay_fields(payment_info, SHREDDED_KEPT_KEYS)
+        obj.save(update_fields=["info"])
 
-        for le in (
+        for entry in (
             obj.order.all_logentries()
             .filter(action_type="eventyay_bitpay.event")
             .exclude(data="")
         ):
-            d = le.parsed_data
-            if isinstance(d.get("data"), dict):
-                for k, v in list(d["data"].items()):
-                    if k not in SHREDDED_KEPT_KEYS:
-                        d["data"][k] = "█"
-                le.data = json.dumps(d)
-                le.shredded = True
-                le.save(update_fields=["data", "shredded"])
+            payload = entry.parsed_data
+            if isinstance(payload, dict) and "data" in payload:
+                # Extended notifications wrap the invoice data and event metadata.
+                redacted = redact_bitpay_fields(payload, {"data", "event"})
+                redacted["data"] = redact_bitpay_fields(
+                    payload["data"], SHREDDED_KEPT_KEYS
+                )
+                if "event" in redacted:
+                    redacted["event"] = redact_bitpay_fields(
+                        payload["event"], {"code", "name"}
+                    )
+            else:
+                redacted = redact_bitpay_fields(payload, SHREDDED_KEPT_KEYS)
+            entry.data = json.dumps(redacted)
+            entry.shredded = True
+            entry.save(update_fields=["data", "shredded"])
+
+
+def redact_bitpay_fields(data: object, kept_keys: Container[str]) -> dict:
+    if not isinstance(data, dict):
+        return {}
+    return {key: value if key in kept_keys else "█" for key, value in data.items()}
