@@ -24,6 +24,22 @@ from .models import ReferencedBitPayObject
 
 logger = logging.getLogger(__name__)
 
+# Keys of a stored BitPay invoice that identify the payment but not the payer. Everything else, such as buyer
+# details, is masked when the payment info is shredded.
+SHREDDED_KEPT_KEYS = frozenset(
+    {
+        "id",
+        "status",
+        "price",
+        "currency",
+        "invoiceTime",
+        "paymentSubtotals",
+        "paymentTotals",
+        "transactionCurrency",
+        "amountPaid",
+    }
+)
+
 
 class BitPay(BasePaymentProvider):
     identifier = "bitpay"
@@ -319,17 +335,7 @@ class BitPay(BasePaymentProvider):
     def shred_payment_info(self, obj: Union[OrderPayment, OrderRefund]):
         d = obj.info_data
         for k, v in list(d.items()):
-            if v not in (
-                "id",
-                "status",
-                "price",
-                "currency",
-                "invoiceTime",
-                "paymentSubtotals",
-                "paymentTotals",
-                "transactionCurrency",
-                "amountPaid",
-            ):
+            if k not in SHREDDED_KEPT_KEYS:
                 d[k] = "█"
         obj.info_data = d
         obj.save()
@@ -340,19 +346,9 @@ class BitPay(BasePaymentProvider):
             .exclude(data="")
         ):
             d = le.parsed_data
-            if "data" in d:
+            if isinstance(d.get("data"), dict):
                 for k, v in list(d["data"].items()):
-                    if v not in (
-                        "id",
-                        "status",
-                        "price",
-                        "currency",
-                        "invoiceTime",
-                        "paymentSubtotals",
-                        "paymentTotals",
-                        "transactionCurrency",
-                        "amountPaid",
-                    ):
+                    if k not in SHREDDED_KEPT_KEYS:
                         d["data"][k] = "█"
                 le.data = json.dumps(d)
                 le.shredded = True
